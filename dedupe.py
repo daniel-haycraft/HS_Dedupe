@@ -229,7 +229,7 @@ def fetch_all_contacts():
         params = {'limit': 100, 'properties': ','.join(MATCH_PROPS)}
         if after:
             params['after'] = after
-        data = hs_request('GET', '/crm/v3/objects/contacts', params=params)
+        data = hs_request('GET', '/crm/objects/2026-03/contacts', params=params)
         for r in data.get('results', []):
             p = r.get('properties', {})
             contacts.append({
@@ -260,7 +260,7 @@ def fetch_all_contacts():
 def fetch_property_defs():
     """Every contact property definition in the portal: name, label, and for dropdowns, the options.
     Used for two things: the full property list for the Snapshot, and label -> value lookup in section 4."""
-    data = hs_request('GET', '/crm/v3/properties/contacts')
+    data = hs_request('GET', '/crm/properties/2026-03/0-1')
     return {p['name']: p for p in data.get('results', [])}
 
 
@@ -270,7 +270,7 @@ def fetch_full_records(ids, prop_names):
     ids = list(ids)
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
-        data = hs_request('POST', '/crm/v3/objects/contacts/batch/read',
+        data = hs_request('POST', '/crm/objects/2026-03/contacts/batch/read',
                           json={'properties': prop_names, 'inputs': [{'id': cid} for cid in chunk]})
         for r in data.get('results', []):
             out[str(r['id'])] = r.get('properties', {})
@@ -285,7 +285,7 @@ def fetch_associations(ids, to_object):
     ids = list(ids)
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
-        data = hs_request('POST', f'/crm/v4/associations/contacts/{to_object}/batch/read',
+        data = hs_request('POST', f'/crm/associations/2026-03/contacts/{to_object}/batch/read{to_object}',
                           json={'inputs': [{'id': cid} for cid in chunk]})
         for r in data.get('results', []):
             out[str(r['from']['id'])] = ', '.join(str(t['toObjectId']) for t in r.get('to', []))
@@ -296,7 +296,7 @@ def fetch_associations(ids, to_object):
 def patch_contact(cid, props):
     """Update properties on one contact. This is how the guideline values get onto the primary
     BEFORE the merge, so HubSpot's 'primary wins' behaviour keeps them."""
-    hs_request('PATCH', f'/crm/v3/objects/contacts/{cid}', json={'properties': props})
+    hs_request('PATCH', f'/crm/objects/2026-03/contacts/{cid}', json={'properties': props})
 
 
 def merge_contacts(primary_id, secondary_id):
@@ -305,7 +305,7 @@ def merge_contacts(primary_id, secondary_id):
     and are stored in the 'Merged Contact IDs' property. (Unless the portal is in the 'Primary ID
     Preservation' beta, in which case the primary keeps its ID.) Either way, the API returns the
     resulting record, so we return its ID and never assume the primary's ID survived."""
-    data = hs_request('POST', '/crm/v3/objects/contacts/merge',
+    data = hs_request('POST', '/crm/objects/2026-03/contacts/merge',
                       json={'primaryObjectId': str(primary_id), 'objectIdToMerge': str(secondary_id)})
     return str(data.get('id') or primary_id)
 
