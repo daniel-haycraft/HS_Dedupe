@@ -2,7 +2,7 @@ name: HubSpot duplicate check
 
 on:
   schedule:
-    - cron: '0 13 * * *'        # 6:00 AM Arizona (UTC-7), every day
+        - cron: '0 13 * * 1-4'        # 6:00 AM Arizona (UTC-7), every day
   workflow_dispatch:
     inputs:
       lookback_days:
