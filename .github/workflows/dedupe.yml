@@ -9,6 +9,10 @@ on:
         description: 'Days of modified contacts to check (use 180 for the first run)'
         required: false
         default: '3'
+      force_full_pull:
+        description: 'Ignore the cache and re-pull every contact (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   dedupe:
@@ -23,6 +27,15 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Pull the contact cache saved by the previous run (if any).
+      # restore-keys matches the most recent cache whose key starts with "contacts-cache-".
+      - uses: actions/cache/restore@v4
+        with:
+          path: contacts_cache.json.gz
+          key: contacts-cache-${{ github.run_id }}
+          restore-keys: |
+            contacts-cache-
+
       - run: python dedupe.py
         env:
           HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
@@ -31,3 +44,12 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '3' }}
           MERGE_ENABLED: ${{ vars.MERGE_ENABLED || 'false' }}
+          FORCE_FULL_PULL: ${{ github.event.inputs.force_full_pull || 'false' }}
+
+      # Save the updated cache for the next run. if: always() so a failed merge step
+      # doesn't throw away a 15-minute pull.
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: contacts_cache.json.gz
+          key: contacts-cache-${{ github.run_id }}
