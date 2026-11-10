@@ -18,6 +18,9 @@ Match rules (two stages, both need a shared phone, cross-matched Phone/Mobile ei
                     Mike/Michael, Rober/Robert). A cheap prefilter in code picks these, then Claude
                     looks at both full records and answers same person yes/no with a confidence
                     and a one-line reason. Only a 'yes' at or above CONFIDENCE_MIN can merge.
+                    Verdicts are remembered (in the contact cache) with a fingerprint of the fields
+                    Claude saw. A pair is only re-asked if one of its records changed. Pairs already
+                    judged 'not duplicate' are not re-listed in the sheet unless they change.
   Shared lines:     a phone on more than SHARED_LINE_CAP contacts is an office switchboard, not a
                     duplicate. Those groups are skipped entirely and listed on the Shared Lines tab.
 Primary:     the older record (by Create Date) wins. Tie -> lower Record ID.
@@ -824,6 +827,51 @@ def describe_changes(changes, prop_defs):
     return '; '.join(parts)
 
 
+JUDGE_FIELDS = ['first_raw', 'last_raw', 'email', 'phone_raw', 'mobile_raw', 'owner',
+                'lead_status', 'contact_type', 'lead_source', 'deals']
+
+
+def pair_fingerprint(p):
+    """A short hash of everything Claude is shown for this pair. If either record changes any of
+    these fields, the fingerprint changes and the pair gets judged again."""
+    import hashlib
+    parts = []
+    for c in (p['primary'], p['secondary']):
+        parts.append('|'.join(str(c.get(f, '')) for f in JUDGE_FIELDS))
+    return hashlib.sha1('||'.join(parts).encode('utf-8')).hexdigest()[:16]
+
+
+def judge_with_memory(stage2, verdicts):
+    """Reuse saved verdicts for pairs whose records haven't changed; ask Claude only about the rest.
+    verdicts is a dict stored in the cache meta: {pair_key: {sig, verdict, confidence, reason, run}}.
+    Returns (asked_count, reused_count)."""
+    to_ask = []
+    reused = 0
+    for p in stage2:
+        key = f"{p['primary']['id']}-{p['secondary']['id']}"
+        sig = pair_fingerprint(p)
+        saved = verdicts.get(key)
+        if saved and saved.get('sig') == sig and saved.get('verdict') in ('yes', 'no', 'review'):
+            p['verdict'] = saved['verdict']
+            p['confidence'] = saved.get('confidence', '')
+            p['reason'] = saved.get('reason', '')
+            p['decided_by'] = f"claude (cached {saved.get('run', '')[:10]})"
+            p['cached'] = True
+            reused += 1
+        else:
+            p['cached'] = False
+            to_ask.append((p, key, sig))
+    if to_ask:
+        claude_judge([t[0] for t in to_ask])
+        for p, key, sig in to_ask:
+            p['decided_by'] = 'claude'
+            # Don't remember 'review' answers that came from an API failure; let those retry next run.
+            if p['verdict'] in ('yes', 'no') or (p['verdict'] == 'review' and p['confidence'] != ''):
+                verdicts[key] = {'sig': sig, 'verdict': p['verdict'], 'confidence': p['confidence'],
+                                 'reason': p['reason'], 'run': RUN_ID}
+    return len(to_ask), reused
+
+
 # =====================================================================
 # 7. GOOGLE SHEETS
 # Two tabs. Both are append-only logs; nothing is ever deleted or rewritten except the Snapshot
@@ -1003,12 +1051,22 @@ def main():
             p['decided_by'] = 'claude'
     stage2 = [p for p in pairs if p['stage'] == 2]
     if stage2:
-        print(f'Asking Claude about {len(stage2)} stage 2 pairs ({CLAUDE_MODEL})...')
-        claude_judge(stage2)
+        verdicts = cache_meta.setdefault('verdicts', {})
+        asked, reused = judge_with_memory(stage2, verdicts)
+        print(f'Stage 2: {reused} verdicts reused from memory, {asked} asked to Claude ({CLAUDE_MODEL})')
         v = {}
         for p in stage2:
             v[p['verdict']] = v.get(p['verdict'], 0) + 1
-        print(f'  Claude verdicts: {v}')
+        print(f'  verdicts: {v}')
+        # Forget verdicts for pairs that no longer exist (merged or deleted) so the memory doesn't grow forever.
+        live = {f"{p['primary']['id']}-{p['secondary']['id']}" for p in stage2}
+        for key in list(verdicts):
+            if key not in live:
+                del verdicts[key]
+        save_cache(contacts_by_id, cache_meta)
+
+    # Pairs Claude already said 'no' to on an earlier run stay out of the sheet unless something changed.
+    pairs = [p for p in pairs if not (p.get('cached') and p['verdict'] == 'no')]
 
     # ---------------------------------------------------------------
     # STEP 4: Guideline changes
