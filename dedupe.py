@@ -693,24 +693,33 @@ def find_pairs(contacts):
 # It never touches HubSpot and never overrides the CF1 rules in section 6.
 # =====================================================================
 
-JUDGE_SYSTEM = """You are deduplicating a CRM for a private real estate lender. You will be shown pairs of
-contact records that share a phone number but have different first names. For each pair decide whether
-the two records are the SAME PERSON entered twice, or two different people (spouses, coworkers, a parent
-and child, an assistant) who share a number.
+JUDGE_SYSTEM = JUDGE_SYSTEM = """You are deduplicating contacts in a CRM for a private real estate lender. You will be shown pairs of
+contact records that ALREADY share a phone number and have the same or compatible last name, but have
+similar first names. For each pair decide whether the two records are the SAME PERSON entered twice,
+or two different people (spouses, siblings, coworkers, a parent and child, an assistant) who share a number.
 
-Signals that point to the same person: first names that are nicknames, abbreviations, typos, or
-misspellings of each other (Ben/Benjamin, Mike/Michael, Rober/Robert, Jon/Jonathan); matching or
-near-matching last names; the same or a similar email; the same company; the same owner.
-Signals that point to different people: clearly different first names that are not nickname-related;
-different last names; different emails at the same domain that look like two people; one record
-clearly being a spouse or colleague.
+Start from "probably the same person": a shared phone plus the same last name plus first names that are
+nicknames, abbreviations, typos or misspellings of each other (Ben/Benjamin, Mike/Michael, Rober/Robert,
+Jon/Jonathan, Samatha/Samantha) is strong evidence on its own. Matching or similar emails, the same
+company, or the same lead source make it stronger.
 
-Be conservative: when the evidence is thin or mixed, say no or give a low confidence. A wrong merge
-is expensive and not reversible. A missed merge just gets reviewed by a human.
+Things that do NOT count against a match:
+  - different contact owners (that's just who the lead was assigned to)
+  - different lead status, contact type, deal counts, or create dates (one record is older, that's normal)
+  - one record having a second phone or mobile number the other doesn't (people have a work line and a cell,
+    and change cells). Treat this as neutral unless there are other signs of two people.
+
+Things that DO count against a match:
+  - first names that are genuinely different people's names, not nickname or spelling variants
+    (Mike vs Michelle, Luis vs Lucas, Chris vs Christine)
+  - emails that look like two different people (two different first names at the same domain, e.g.
+    ben.smith@ and jen.smith@)
+  - an explicit cue of a relationship (Jr/Sr, "wife", "assistant", a company that lists two principals)
 
 Answer with ONLY a JSON array, one object per pair, in the same order, no prose and no code fences:
 [{"pair": 1, "same_person": true, "confidence": 0.95, "reason": "one short sentence"}, ...]
-confidence is 0 to 1."""
+confidence is 0 to 1. Use 0.9 or above when the name variant and last name line up and nothing on the
+"counts against" list is present. Go lower only when something on that list is present."""
 
 
 def _record_block(label, c):
