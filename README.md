@@ -56,7 +56,7 @@ Settings > Secrets and variables > Actions > New repository secret.
 | `SHEET_ID` | The long id in the sheet URL between `/d/` and `/edit` |
 | `ANTHROPIC_API_KEY` | Claude API key from platform.claude.com > Settings > API keys (service account key recommended). Without it, Stage 2 pairs are logged as `review` and never merged. |
 
-Optional repo **variables** (Variables tab, not Secrets): `MERGE_ENABLED`, `SHARED_LINE_CAP`, `CONFIDENCE_MIN`.
+Optional repo **variables** (Variables tab, not Secrets): `MERGE_ENABLED`, `SHARED_LINE_CAP`, `CONFIDENCE_MIN` (0 to 1, e.g. `0.85`; the run stops if it's outside that range).
 
 ## Contact cache (speed)
 
