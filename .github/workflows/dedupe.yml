@@ -2,7 +2,7 @@ name: HubSpot duplicate check
 
 on:
   schedule:
-        - cron: '0 13 * * 1-4'        # 6:00 AM Arizona (UTC-7), every day
+    - cron: '0 13 * * *'        # 6:00 AM Arizona (UTC-7), every day
   workflow_dispatch:
     inputs:
       lookback_days:
@@ -13,6 +13,14 @@ on:
         description: 'Ignore the cache and re-pull every contact (true/false)'
         required: false
         default: 'false'
+      only_ids:
+        description: 'Testing: comma-separated Record IDs to limit the run to (blank = all)'
+        required: false
+        default: ''
+      max_merges:
+        description: 'Testing: max merges this run (blank or 0 = no cap)'
+        required: false
+        default: ''
 
 jobs:
   dedupe:
@@ -45,6 +53,11 @@ jobs:
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '3' }}
           MERGE_ENABLED: ${{ vars.MERGE_ENABLED || 'false' }}
           FORCE_FULL_PULL: ${{ github.event.inputs.force_full_pull || 'false' }}
+          ONLY_IDS: ${{ github.event.inputs.only_ids || '' }}
+          MAX_MERGES: ${{ github.event.inputs.max_merges || '0' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SHARED_LINE_CAP: ${{ vars.SHARED_LINE_CAP || '5' }}
+          CONFIDENCE_MIN: ${{ vars.CONFIDENCE_MIN || '0.85' }}
 
       # Save the updated cache for the next run. if: always() so a failed merge step
       # doesn't throw away a 15-minute pull.
