@@ -12,8 +12,14 @@ HOW TO READ THIS FILE
     7. GOOGLE SHEETS       - writing the Merge Log and Snapshot tabs
     8. MAIN                - the actual run order: load, match, snapshot, merge, log
 
-Match rule:  same First Name (exact, case-insensitive) AND a shared phone,
-             cross-matched (Phone or Mobile on one record vs Phone or Mobile on the other).
+Match rules (two stages, both need a shared phone, cross-matched Phone/Mobile either way):
+  Stage 1 (code):   same First Name, exact after lowercasing. Decided in code, no AI cost.
+  Stage 2 (Claude): first names differ but could plausibly be the same person (Ben/Benjamin,
+                    Mike/Michael, Rober/Robert). A cheap prefilter in code picks these, then Claude
+                    looks at both full records and answers same person yes/no with a confidence
+                    and a one-line reason. Only a 'yes' at or above CONFIDENCE_MIN can merge.
+  Shared lines:     a phone on more than SHARED_LINE_CAP contacts is an office switchboard, not a
+                    duplicate. Those groups are skipped entirely and listed on the Shared Lines tab.
 Primary:     the older record (by Create Date) wins. Tie -> lower Record ID.
 
 Merge behaviour (HubSpot default): the primary keeps its own value wherever both records have one,
@@ -47,6 +53,15 @@ Env vars (GitHub Secrets / Variables):
   FULL_REFRESH_DAYS   default 7. Re-pull everything from scratch when the cache is older than this,
                       so contacts deleted in HubSpot eventually fall out of the copy.
   FORCE_FULL_PULL     'true' to ignore the cache and re-pull everything this run.
+  ONLY_IDS            testing: comma-separated Record IDs. Only pairs involving these IDs are
+                      logged / snapshotted / merged. Blank = all pairs.
+  MAX_MERGES          testing: cap on merges per run. Pairs past the cap are logged as 'proposed'.
+                      Blank or 0 = no cap.
+  ANTHROPIC_API_KEY   Claude API key for Stage 2. If missing, Stage 2 pairs are logged as 'review'
+                      and never merged.
+  CLAUDE_MODEL        default claude-sonnet-5-5.
+  SHARED_LINE_CAP     default 5. A phone on MORE than this many contacts is a shared line: skipped.
+  CONFIDENCE_MIN      default 0.85. Stage 2 'yes' below this is logged as 'review', not merged.
 
 Contact cache: the first run pulls all contacts (slow, ~15 min) and saves them to CACHE_FILE.
 GitHub Actions keeps that file between runs. Every run after that only asks HubSpot for contacts
@@ -82,17 +97,25 @@ MERGE_ENABLED = os.environ.get('MERGE_ENABLED', 'false').strip().lower() == 'tru
 CACHE_FILE = os.environ.get('CACHE_FILE', 'contacts_cache.json.gz')
 FULL_REFRESH_DAYS = int(os.environ.get('FULL_REFRESH_DAYS', '7'))
 FORCE_FULL_PULL = os.environ.get('FORCE_FULL_PULL', 'false').strip().lower() == 'true'
+ONLY_IDS = {x.strip() for x in os.environ.get('ONLY_IDS', '').split(',') if x.strip()}   # testing
+MAX_MERGES = int(os.environ.get('MAX_MERGES', '0') or 0)                                 # testing, 0 = no cap
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5-5')
+SHARED_LINE_CAP = int(os.environ.get('SHARED_LINE_CAP', '5') or 5)
+CONFIDENCE_MIN = float(os.environ.get('CONFIDENCE_MIN', '0.85') or 0.85)
 
 LOG_TAB = 'Merge Log'
 SNAPSHOT_TAB = 'Snapshot'
+SHARED_TAB = 'Shared Lines'
 
 HS = 'https://api.hubapi.com'
 HEADERS = {'Authorization': f'Bearer {HUBSPOT_TOKEN}', 'Content-Type': 'application/json'}
 
 # Only these properties are pulled during the full 185k-contact scan. Keeping this list short is
 # what keeps the pull fast. The Snapshot step pulls EVERY property, but only for the pairs found.
-MATCH_PROPS = ['firstname', 'lastname', 'phone', 'mobilephone', 'createdate', 'hs_lastmodifieddate',
-               'num_associated_deals', 'hs_lead_status', 'contact_type_2_0', 'sales_lead_source_2_0']
+MATCH_PROPS = ['firstname', 'lastname', 'phone', 'mobilephone', 'email', 'hubspot_owner_id', 'createdate',
+               'hs_lastmodifieddate', 'notes_last_updated', 'num_associated_deals',
+               'hs_lead_status', 'contact_type_2_0', 'sales_lead_source_2_0']
 
 # The three properties the CF1 guideline rules care about (HubSpot internal names).
 LEAD_STATUS_PROP = 'hs_lead_status'
@@ -241,6 +264,10 @@ def make_contact(r):
         'first': clean_first(p.get('firstname')),       # matching key
         'first_raw': p.get('firstname') or '',          # for the sheet
         'last_raw': p.get('lastname') or '',
+        'last': clean_first(p.get('lastname')),          # matching key for the Stage 2 prefilter
+        'email': p.get('email') or '',
+        'owner': p.get('hubspot_owner_id') or '',
+        'last_activity': p.get('notes_last_updated') or '',
         'phone_raw': p.get('phone') or '',
         'mobile_raw': p.get('mobilephone') or '',
         'phone_keys': phone_keys(p.get('phone')),       # matching keys
@@ -505,48 +532,239 @@ def parse_hs_date(s):
         return datetime.max.replace(tzinfo=timezone.utc)
 
 
+# Common nickname families. Two first names in the same set are "plausibly the same person"
+# for the Stage 2 prefilter. Add to this freely; it only decides what Claude gets to look at.
+NICKNAMES = [
+    {'robert', 'rob', 'bob', 'bobby', 'robbie', 'bert'}, {'william', 'will', 'bill', 'billy', 'willie', 'liam'},
+    {'richard', 'rick', 'dick', 'rich', 'richie', 'ricky'}, {'michael', 'mike', 'mikey', 'mick', 'micky'},
+    {'james', 'jim', 'jimmy', 'jamie'}, {'john', 'jon', 'johnny', 'jack', 'jonathan'},
+    {'joseph', 'joe', 'joey', 'jose'}, {'thomas', 'tom', 'tommy'}, {'charles', 'charlie', 'chuck', 'chas'},
+    {'christopher', 'chris', 'kit'}, {'daniel', 'dan', 'danny'}, {'matthew', 'matt', 'matty'},
+    {'anthony', 'tony'}, {'andrew', 'andy', 'drew'}, {'edward', 'ed', 'eddie', 'ted', 'teddy', 'ned'},
+    {'benjamin', 'ben', 'benny'}, {'samuel', 'sam', 'sammy'}, {'nicholas', 'nick', 'nicky'},
+    {'alexander', 'alex', 'xander', 'al'}, {'steven', 'stephen', 'steve'}, {'kenneth', 'ken', 'kenny'},
+    {'david', 'dave', 'davey'}, {'donald', 'don', 'donny'}, {'ronald', 'ron', 'ronnie'},
+    {'timothy', 'tim', 'timmy'}, {'patrick', 'pat', 'paddy'}, {'gregory', 'greg'}, {'jeffrey', 'jeff'},
+    {'lawrence', 'larry', 'laurence'}, {'raymond', 'ray'}, {'peter', 'pete'}, {'gerald', 'gerry', 'jerry'},
+    {'frederick', 'fred', 'freddie'}, {'leonard', 'leo', 'lenny'}, {'eugene', 'gene'}, {'douglas', 'doug'},
+    {'albert', 'al', 'bert'}, {'francis', 'frank', 'frankie'}, {'henry', 'hank', 'harry'},
+    {'elizabeth', 'liz', 'beth', 'betty', 'eliza', 'lizzie', 'libby'}, {'katherine', 'catherine', 'kate', 'katie', 'kathy', 'cathy', 'kat'},
+    {'margaret', 'maggie', 'meg', 'peggy', 'marge'}, {'jennifer', 'jen', 'jenny'}, {'jessica', 'jess', 'jessie'},
+    {'patricia', 'pat', 'patty', 'trish', 'tricia'}, {'susan', 'sue', 'susie', 'suzy'}, {'deborah', 'deb', 'debbie'},
+    {'rebecca', 'becky', 'becca'}, {'victoria', 'vicky', 'tori'}, {'christina', 'christine', 'chris', 'tina', 'chrissy'},
+    {'stephanie', 'steph'}, {'samantha', 'sam'}, {'alexandra', 'alex', 'lexi', 'sandra'}, {'kimberly', 'kim'},
+    {'michelle', 'shelly'}, {'nicole', 'nikki'}, {'danielle', 'dani'}, {'theresa', 'teresa', 'terry', 'tess'},
+    {'barbara', 'barb', 'barbie'}, {'dorothy', 'dot', 'dottie'}, {'amanda', 'mandy'}, {'melissa', 'mel', 'missy'},
+    {'jacqueline', 'jackie'}, {'veronica', 'ronnie'}, {'abigail', 'abby'}, {'natalie', 'nat'},
+    {'joshua', 'josh'}, {'zachary', 'zach', 'zack'}, {'jacob', 'jake'}, {'nathan', 'nathaniel', 'nate'},
+    {'maximilian', 'max'}, {'vincent', 'vince', 'vinny'}, {'manuel', 'manny'}, {'alejandro', 'alex'},
+    {'francisco', 'frank', 'paco', 'pancho'}, {'guillermo', 'memo'}, {'ignacio', 'nacho'}, {'rafael', 'rafa'},
+    {'eduardo', 'ed', 'eddie', 'lalo'}, {'jesus', 'chuy'}, {'roberto', 'rob', 'beto'}, {'ricardo', 'rick', 'ricky'},
+]
+_NICK = {}
+for fam in NICKNAMES:
+    for n in fam:
+        _NICK.setdefault(n, set()).update(fam)
+
+
+def _edit_distance(a, b):
+    """Plain Levenshtein. Fine for short names."""
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def names_plausible(a, b):
+    """Stage 2 prefilter. Could first names a and b (already cleaned) be the same person?
+    Yes if: one starts with the other (ben/benjamin, rober/robert), nickname family (mike/michael),
+    or within 2 edits (robrt/robert, jon/john). This only decides whether Claude gets asked."""
+    if not a or not b or a == b:
+        return False
+    fa, fb = a.split()[0], b.split()[0]            # first token only: "mary ann" -> "mary"
+    if fa.startswith(fb) or fb.startswith(fa):
+        return True
+    if fb in _NICK.get(fa, ()):
+        return True
+    if _edit_distance(fa, fb) <= 2 and min(len(fa), len(fb)) >= 3:
+        return True
+    return False
+
+
+def last_names_compatible(a, b):
+    """Same last name, or one side blank, or within 1 edit. Different last names = not the same person
+    for our purposes (even on a shared number)."""
+    if not a or not b:
+        return True
+    return a == b or _edit_distance(a, b) <= 1
+
+
+def parse_hs_date(s):
+    """HubSpot dates look like '2024-11-25T10:14:03.123Z'. Unparseable -> far future, so a record
+    with a missing date never wins 'oldest'."""
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _order(a, b, my_col, their_col):
+    """Older record becomes primary. Compare (create date, id) so ties are deterministic."""
+    if (parse_hs_date(b['created']), int(b['id'])) < (parse_hs_date(a['created']), int(a['id'])):
+        return b, a, their_col, my_col
+    return a, b, my_col, their_col
+
+
 def find_pairs(contacts):
-    """Returns a list of pair dicts: {primary, secondary, phone, how}.
-    Each unordered pair of IDs appears once, no matter how many phones they share."""
+    """Returns (pairs, shared_lines).
+    pairs: list of dicts {primary, secondary, phone, how, stage} where stage is 1 (exact first name,
+           decided in code) or 2 (plausible first name, needs Claude).
+    shared_lines: list of (phone, [contacts]) for numbers on more than SHARED_LINE_CAP contacts.
+    Each unordered pair of IDs appears once."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
-    # The index. Key is (first name, phone key). Value is every (contact, which column) that has it.
-    # A contact with a phone and a mobile goes in twice. Contacts with no first name are skipped
-    # entirely, because first name is half of the match rule.
-    index = {}
+    # Index by phone key only: phone key -> every (contact, which column) that has it.
+    # A contact with a phone and a mobile goes in under both numbers.
+    by_phone = {}
     for c in contacts:
-        if not c['first']:
-            continue
         for k in c['phone_keys']:
-            index.setdefault((c['first'], k), []).append((c, 'Phone'))
+            by_phone.setdefault(k, []).append((c, 'Phone'))
         for k in c['mobile_keys']:
-            index.setdefault((c['first'], k), []).append((c, 'Mobile'))
+            by_phone.setdefault(k, []).append((c, 'Mobile'))
+
+    # Shared lines: a number on more than SHARED_LINE_CAP distinct contacts is a switchboard.
+    # Those numbers are pulled out of the index entirely so they can't make pairs in either stage.
+    shared_lines = []
+    for k, entries in list(by_phone.items()):
+        distinct = {e[0]['id'] for e in entries}
+        if len(distinct) > SHARED_LINE_CAP:
+            shared_lines.append((k, [e[0] for e in entries]))
+            del by_phone[k]
 
     # Only recently modified contacts get checked. They're checked against the FULL index though.
-    candidates = [c for c in contacts if c['first'] and parse_hs_date(c['modified']) >= cutoff]
-    print(f'{len(contacts)} contacts total, {len(candidates)} modified in last {LOOKBACK_DAYS} days')
+    candidates = [c for c in contacts if parse_hs_date(c['modified']) >= cutoff]
+    print(f'{len(contacts)} contacts total, {len(candidates)} modified in last {LOOKBACK_DAYS} days, '
+          f'{len(shared_lines)} shared lines skipped')
 
     pairs = {}
     for c in candidates:
-        # Every phone key this contact has, tagged with which column it came from
         mine = [(k, 'Phone') for k in c['phone_keys']] + [(k, 'Mobile') for k in c['mobile_keys']]
         for k, my_col in mine:
-            for other, their_col in index.get((c['first'], k), []):
+            for other, their_col in by_phone.get(k, []):
                 if other['id'] == c['id']:
                     continue                                # a contact always matches itself; ignore
                 key = tuple(sorted((c['id'], other['id'])))  # (A,B) and (B,A) are the same pair
+                if key in pairs and pairs[key]['stage'] == 1:
+                    continue
+                # Stage 1: exact first name (both must have one).
+                if c['first'] and c['first'] == other['first']:
+                    stage = 1
+                # Stage 2: first names differ but plausibly the same person, and last names agree.
+                elif names_plausible(c['first'], other['first']) and last_names_compatible(c['last'], other['last']):
+                    stage = 2
+                else:
+                    continue
                 if key in pairs:
                     continue
-                a, b = c, other
-                # Older record becomes primary. Compare (create date, id) so ties are deterministic.
-                if (parse_hs_date(b['created']), int(b['id'])) < (parse_hs_date(a['created']), int(a['id'])):
-                    a, b = b, a
-                    my_col, their_col = their_col, my_col
-                pairs[key] = {'primary': a, 'secondary': b, 'phone': format_phone(k), 'how': f'{my_col} vs {their_col}'}
+                a, b, mc, tc = _order(c, other, my_col, their_col)
+                pairs[key] = {'primary': a, 'secondary': b, 'phone': format_phone(k),
+                              'how': f'{mc} vs {tc}', 'stage': stage}
 
     # Oldest primaries first. If A<-B and A<-C both exist, A gets both merges in order. If B<-C also
-    # exists, by the time we reach it B is already gone and main() redirects C into A.
-    return sorted(pairs.values(), key=lambda p: (parse_hs_date(p['primary']['created']), int(p['primary']['id'])))
+    # exists, by the time we reach it B is already gone and main() redirects C into the survivor.
+    ordered = sorted(pairs.values(), key=lambda p: (parse_hs_date(p['primary']['created']), int(p['primary']['id'])))
+    return ordered, shared_lines
+
+
+# =====================================================================
+# 5b. CLAUDE JUDGE (Stage 2 only)
+# Claude sees both full records and answers: same person? how sure? why?
+# It never touches HubSpot and never overrides the CF1 rules in section 6.
+# =====================================================================
+
+JUDGE_SYSTEM = """You are deduplicating a CRM for a private real estate lender. You will be shown pairs of
+contact records that share a phone number but have different first names. For each pair decide whether
+the two records are the SAME PERSON entered twice, or two different people (spouses, coworkers, a parent
+and child, an assistant) who share a number.
+
+Signals that point to the same person: first names that are nicknames, abbreviations, typos, or
+misspellings of each other (Ben/Benjamin, Mike/Michael, Rober/Robert, Jon/Jonathan); matching or
+near-matching last names; the same or a similar email; the same company; the same owner.
+Signals that point to different people: clearly different first names that are not nickname-related;
+different last names; different emails at the same domain that look like two people; one record
+clearly being a spouse or colleague.
+
+Be conservative: when the evidence is thin or mixed, say no or give a low confidence. A wrong merge
+is expensive and not reversible. A missed merge just gets reviewed by a human.
+
+Answer with ONLY a JSON array, one object per pair, in the same order, no prose and no code fences:
+[{"pair": 1, "same_person": true, "confidence": 0.95, "reason": "one short sentence"}, ...]
+confidence is 0 to 1."""
+
+
+def _record_block(label, c):
+    return (f"{label}: id={c['id']} first='{c['first_raw']}' last='{c['last_raw']}' email='{c.get('email','')}' "
+            f"phone='{c['phone_raw']}' mobile='{c['mobile_raw']}' owner_id='{c.get('owner','')}' "
+            f"lead_status='{c['lead_status']}' contact_type='{c['contact_type']}' lead_source='{c['lead_source']}' "
+            f"deals={c['deals']} created='{c['created'][:10]}' last_activity='{c.get('last_activity','')[:10]}'")
+
+
+def claude_judge(pairs, batch_size=10):
+    """Fills p['verdict'] ('yes'/'no'/'review'), p['confidence'], p['reason'] on each Stage 2 pair.
+    Batches several pairs per API call to keep it cheap. Any parse or API failure -> 'review'."""
+    if not pairs:
+        return
+    if not ANTHROPIC_API_KEY:
+        for p in pairs:
+            p['verdict'], p['confidence'], p['reason'] = 'review', '', 'ANTHROPIC_API_KEY not set'
+        print('  ANTHROPIC_API_KEY not set: Stage 2 pairs logged as review')
+        return
+
+    headers = {'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'}
+    for i in range(0, len(pairs), batch_size):
+        batch = pairs[i:i + batch_size]
+        lines = []
+        for n, p in enumerate(batch, 1):
+            lines.append(f"PAIR {n} (shared number {p['phone']}, {p['how']})")
+            lines.append(_record_block('  A', p['primary']))
+            lines.append(_record_block('  B', p['secondary']))
+        body = {'model': CLAUDE_MODEL, 'max_tokens': 200 * len(batch), 'system': JUDGE_SYSTEM,
+                'messages': [{'role': 'user', 'content': '\n'.join(lines)}]}
+        text = ''
+        for attempt in range(4):
+            try:
+                resp = requests.post('https://api.anthropic.com/v1/messages', headers=headers, json=body, timeout=120)
+                if resp.status_code in (429, 529) or resp.status_code >= 500:
+                    time.sleep(2 ** attempt * 2)
+                    continue
+                resp.raise_for_status()
+                text = ''.join(b.get('text', '') for b in resp.json().get('content', []) if b.get('type') == 'text')
+                break
+            except requests.RequestException as e:
+                print(f'  Claude API error: {e}')
+                time.sleep(2 ** attempt * 2)
+        try:
+            clean = re.sub(r'^```(?:json)?|```$', '', text.strip(), flags=re.M).strip()
+            answers = {int(a['pair']): a for a in json.loads(clean)}
+        except Exception:
+            answers = {}
+            print(f'  could not parse Claude answer for batch starting at pair {i + 1}: {text[:200]!r}')
+        for n, p in enumerate(batch, 1):
+            a = answers.get(n)
+            if not a:
+                p['verdict'], p['confidence'], p['reason'] = 'review', '', 'no answer from Claude'
+                continue
+            conf = float(a.get('confidence', 0) or 0)
+            same = bool(a.get('same_person'))
+            p['confidence'] = round(conf, 2)
+            p['reason'] = str(a.get('reason', ''))[:300]
+            p['verdict'] = 'yes' if (same and conf >= CONFIDENCE_MIN) else ('review' if same else 'no')
+        time.sleep(0.5)
 
 
 # =====================================================================
@@ -615,6 +833,7 @@ def describe_changes(changes, prop_defs):
 # =====================================================================
 
 LOG_HEADER = ['Run', 'Status', 'Primary ID', 'Secondary ID', 'First Name', 'Matched Phone', 'Matched How',
+              'Decided By', 'Confidence', 'Reason',
               'Primary Changes', 'Merge Result', 'Resulting ID', 'Resulting Link',
               'Primary Last Name', 'Primary Created', 'Primary Deals', 'Primary Lead Status', 'Primary Contact Type',
               'Primary Lead Source', 'Primary Phone', 'Primary Mobile',
@@ -622,6 +841,7 @@ LOG_HEADER = ['Run', 'Status', 'Primary ID', 'Secondary ID', 'First Name', 'Matc
               'Secondary Contact Type', 'Secondary Lead Source', 'Secondary Phone', 'Secondary Mobile',
               'Primary Link', 'Secondary Link']
 SNAP_FIXED = ['Run', 'Record ID', 'Role', 'Pair', 'Deal IDs', 'Company IDs']   # Snapshot's first 6 columns; every property follows
+SHARED_HEADER = ['Run', 'Phone', 'Contact Count', 'Record IDs', 'Names']
 
 
 def append_chunked(ws, rows, size=500):
@@ -706,7 +926,9 @@ def write_snapshot(ws, records, prop_names, deals, companies, roles):
 
 def main():
     # One line at the top of every Actions log so you can see which settings this run used.
-    print(f'Run {RUN_ID} | MERGE_ENABLED={MERGE_ENABLED} | LOOKBACK_DAYS={LOOKBACK_DAYS}')
+    print(f'Run {RUN_ID} | MERGE_ENABLED={MERGE_ENABLED} | LOOKBACK_DAYS={LOOKBACK_DAYS}'
+          f' | ONLY_IDS={sorted(ONLY_IDS) or "-"} | MAX_MERGES={MAX_MERGES or "-"}'
+          f' | SHARED_LINE_CAP={SHARED_LINE_CAP} | CONFIDENCE_MIN={CONFIDENCE_MIN} | CLAUDE={"on" if ANTHROPIC_API_KEY else "off"}')
 
     # ---------------------------------------------------------------
     # STEP 1: Google Sheets connection
@@ -718,6 +940,7 @@ def main():
     sh = gc.open_by_key(SHEET_ID)
     log_ws = get_or_create_tab(sh, LOG_TAB, LOG_HEADER)
     snap_ws = get_or_create_tab(sh, SNAPSHOT_TAB, SNAP_FIXED)
+    shared_ws = get_or_create_tab(sh, SHARED_TAB, SHARED_HEADER)
 
     # ---------------------------------------------------------------
     # STEP 2: Property definitions
@@ -743,11 +966,49 @@ def main():
     # ---------------------------------------------------------------
     contacts_by_id, cache_meta = load_contacts()
     contacts = list(contacts_by_id.values())
-    pairs = find_pairs(contacts)
-    print(f'{len(pairs)} duplicate pairs found')
+    pairs, shared_lines = find_pairs(contacts)
+    s1 = sum(1 for p in pairs if p['stage'] == 1)
+    print(f'{len(pairs)} candidate pairs: {s1} stage 1 (exact name), {len(pairs) - s1} stage 2 (needs Claude)')
+    if ONLY_IDS:
+        # Testing: keep only pairs that touch one of the listed Record IDs.
+        pairs = [p for p in pairs if p['primary']['id'] in ONLY_IDS or p['secondary']['id'] in ONLY_IDS]
+        print(f'ONLY_IDS set ({len(ONLY_IDS)} ids): {len(pairs)} pairs kept')
+
+    # Shared Lines tab: one row per switchboard number, so a human can see what was skipped.
+    if shared_lines:
+        rows = []
+        for k, cs in shared_lines:
+            seen, uniq = set(), []
+            for c in cs:
+                if c['id'] not in seen:
+                    seen.add(c['id']); uniq.append(c)
+            rows.append([RUN_ID, format_phone(k), len(uniq), ', '.join(c['id'] for c in uniq[:50]),
+                         ', '.join(f"{c['first_raw']} {c['last_raw']}".strip() for c in uniq[:50])])
+        append_chunked(shared_ws, rows)
+        print(f'Appended {len(rows)} rows to {SHARED_TAB}')
+
     if not pairs:
         print('No duplicates. Done.')
         return
+
+    # ---------------------------------------------------------------
+    # STEP 3b: Decide each pair
+    # Stage 1 pairs are decided by code (exact first name + shared phone): verdict yes, confidence 1.
+    # Stage 2 pairs go to Claude in batches. Only verdict 'yes' pairs are allowed to merge.
+    # ---------------------------------------------------------------
+    for p in pairs:
+        if p['stage'] == 1:
+            p['verdict'], p['confidence'], p['reason'], p['decided_by'] = 'yes', 1.0, 'exact first name + shared phone', 'code'
+        else:
+            p['decided_by'] = 'claude'
+    stage2 = [p for p in pairs if p['stage'] == 2]
+    if stage2:
+        print(f'Asking Claude about {len(stage2)} stage 2 pairs ({CLAUDE_MODEL})...')
+        claude_judge(stage2)
+        v = {}
+        for p in stage2:
+            v[p['verdict']] = v.get(p['verdict'], 0) + 1
+        print(f'  Claude verdicts: {v}')
 
     # ---------------------------------------------------------------
     # STEP 4: Guideline changes
@@ -778,6 +1039,8 @@ def main():
     # ---------------------------------------------------------------
     roles = {}
     for p in pairs:
+        if p['verdict'] != 'yes':
+            continue                                # 'no' and 'review' pairs are not going to merge; no backup needed
         pair = f"{p['primary']['id']} <- {p['secondary']['id']}"
         roles[p['primary']['id']] = ('primary', pair)
         roles[p['secondary']['id']] = ('secondary', pair)
@@ -815,13 +1078,25 @@ def main():
     # 'if new_id != prim' line simply does nothing. The code works either way.
     # ---------------------------------------------------------------
     merged_into = {}
+    merges_done = 0
     for p in pairs:
         prim, sec = p['primary']['id'], p['secondary']['id']
         p['new_id'] = ''
 
+        # Only a 'yes' can merge. 'no' = Claude says different people. 'review' = not sure enough.
+        if p['verdict'] == 'no':
+            p['status'], p['result'] = 'not duplicate', 'Claude: different people'
+            continue
+        if p['verdict'] == 'review':
+            p['status'], p['result'] = 'review', f'Claude unsure (confidence {p["confidence"]}), needs a human'
+            continue
         # Switch is off: don't touch HubSpot, just label the row and move on.
         if not MERGE_ENABLED:
             p['status'], p['result'] = 'proposed', 'MERGE_ENABLED is off'
+            continue
+        # Testing cap reached: log the rest as proposed.
+        if MAX_MERGES and merges_done >= MAX_MERGES:
+            p['status'], p['result'] = 'proposed', f'MAX_MERGES={MAX_MERGES} reached this run'
             continue
 
         # Follow both IDs through any merges that already happened earlier in this loop.
@@ -847,6 +1122,7 @@ def main():
             if new_id != prim:
                 merged_into[prim] = new_id
             p['new_id'] = new_id
+            merges_done += 1
             p['status'], p['result'] = 'merged', f'{sec} merged into {prim}, result is {new_id}'
             print(f'  merged {sec} + {prim} -> {new_id}')
         except Exception as e:
@@ -891,7 +1167,9 @@ def main():
     for p in pairs:
         a, b = p['primary'], p['secondary']
         log_rows.append([
-            RUN_ID, p['status'], a['id'], b['id'], a['first_raw'], p['phone'], p['how'],
+            RUN_ID, p['status'], a['id'], b['id'],
+            a['first_raw'] if p['stage'] == 1 else f"{a['first_raw']} / {b['first_raw']}", p['phone'], p['how'],
+            p['decided_by'], p['confidence'], p['reason'],
             p['changes_text'], p['result'], p['new_id'], record_link(p['new_id']) if p['new_id'] else '',
             a['last_raw'], a['created'], a['deals'], a['lead_status'], a['contact_type'], a['lead_source'],
             a['phone_raw'], a['mobile_raw'],
