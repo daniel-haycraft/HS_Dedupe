@@ -64,7 +64,8 @@ Env vars (GitHub Secrets / Variables):
                       and never merged.
   CLAUDE_MODEL        default claude-sonnet-5-5.
   SHARED_LINE_CAP     default 5. A phone on MORE than this many contacts is a shared line: skipped.
-  CONFIDENCE_MIN      default 0.85. Stage 2 'yes' below this is logged as 'review', not merged.
+  CONFIDENCE_MIN      default 0.85. Scale is 0 to 1 (same as Claude's confidence). Stage 2 'yes'
+                      below this is logged as 'review', not merged. Anything outside 0-1 stops the run.
 
 Contact cache: the first run pulls all contacts (slow, ~15 min) and saves them to CACHE_FILE.
 GitHub Actions keeps that file between runs. Every run after that only asks HubSpot for contacts
@@ -106,6 +107,8 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '').strip()
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5-5')
 SHARED_LINE_CAP = int(os.environ.get('SHARED_LINE_CAP', '5') or 5)
 CONFIDENCE_MIN = float(os.environ.get('CONFIDENCE_MIN', '0.85') or 0.85)
+if not 0 <= CONFIDENCE_MIN <= 1:
+    sys.exit(f'CONFIDENCE_MIN must be between 0 and 1 (e.g. 0.85), got {CONFIDENCE_MIN}')
 
 LOG_TAB = 'Merge Log'
 SNAPSHOT_TAB = 'Snapshot'
@@ -1146,7 +1149,8 @@ def main():
             p['status'], p['result'] = 'not duplicate', 'Claude: different people'
             continue
         if p['verdict'] == 'review':
-            p['status'], p['result'] = 'review', f'Claude unsure (confidence {p["confidence"]}), needs a human'
+            p['status'], p['result'] = 'review', f'Claude said yes at {p["confidence"]}, below CONFIDENCE_MIN {CONFIDENCE_MIN}' \
+                if p['confidence'] != '' else 'review: no usable answer from Claude'
             continue
         # Switch is off: don't touch HubSpot, just label the row and move on.
         if not MERGE_ENABLED:
