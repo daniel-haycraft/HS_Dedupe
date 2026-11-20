@@ -310,7 +310,7 @@ def fetch_all_contacts():
     return contacts
 
 
-SEARCH_PATHS = ['/crm/objects/2026-03/contacts/search', '/crm/v3/objects/contacts/search']
+SEARCH_PATHS = ['/crm/objects/2026-03/contacts/search']
 
 
 def fetch_modified_since(since_ms):
